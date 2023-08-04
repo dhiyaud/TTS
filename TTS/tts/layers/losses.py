@@ -6,9 +6,13 @@ from coqpit import Coqpit
 from torch import nn
 from torch.nn import functional
 
+from evaluate import load
+from transformers import pipeline
+
 from TTS.tts.utils.helpers import sequence_mask
 from TTS.tts.utils.ssim import SSIMLoss as _SSIMLoss
 from TTS.utils.audio.torch_transforms import TorchSTFT
+from TTS.vocoder.layers.losses import MultiScaleSTFTLoss
 
 
 # pylint: disable=abstract-method
@@ -165,7 +169,7 @@ class BCELossMasked(nn.Module):
 
     def __init__(self, pos_weight: float = None):
         super().__init__()
-        self.register_buffer("pos_weight", torch.tensor([pos_weight]))
+        self.pos_weight = nn.Parameter(torch.tensor([pos_weight]), requires_grad=False)
 
     def forward(self, x, target, length):
         """
@@ -191,21 +195,16 @@ class BCELossMasked(nn.Module):
             mask = sequence_mask(sequence_length=length, max_len=target.size(1))
             num_items = mask.sum()
             loss = functional.binary_cross_entropy_with_logits(
-                x.masked_select(mask),
-                target.masked_select(mask),
-                pos_weight=self.pos_weight.to(x.device),
-                reduction="sum",
+                x.masked_select(mask), target.masked_select(mask), pos_weight=self.pos_weight, reduction="sum"
             )
         else:
-            loss = functional.binary_cross_entropy_with_logits(
-                x, target, pos_weight=self.pos_weight.to(x.device), reduction="sum"
-            )
+            loss = functional.binary_cross_entropy_with_logits(x, target, pos_weight=self.pos_weight, reduction="sum")
             num_items = torch.numel(x)
         loss = loss / num_items
         return loss
 
 
-class DifferentialSpectralLoss(nn.Module):
+class DifferentailSpectralLoss(nn.Module):
     """Differential Spectral Loss
     https://arxiv.org/ftp/arxiv/papers/1909/1909.10302.pdf"""
 
@@ -340,7 +339,7 @@ class TacotronLoss(torch.nn.Module):
             self.criterion_ga = GuidedAttentionLoss(sigma=ga_sigma)
         # differential spectral loss
         if c.postnet_diff_spec_alpha > 0 or c.decoder_diff_spec_alpha > 0:
-            self.criterion_diff_spec = DifferentialSpectralLoss(loss_func=self.criterion)
+            self.criterion_diff_spec = DifferentailSpectralLoss(loss_func=self.criterion)
         # ssim loss
         if c.postnet_ssim_alpha > 0 or c.decoder_ssim_alpha > 0:
             self.criterion_ssim = SSIMLoss()
@@ -637,6 +636,17 @@ class VitsGeneratorLoss(nn.Module):
             do_amp_to_db=True,
         )
 
+        # CTL
+        self.wer = load("wer")
+        self.transcriber = pipeline(
+            "automatic-speech-recognition",
+            model="facebook/wav2vec2-base-960h",
+            device=0 if torch.cuda.is_available() else -1,
+        )
+
+        # MultiScaleSTFTLoss
+        # self.stft_loss = MultiScaleSTFTLoss()
+
     @staticmethod
     def feature_loss(feats_real, feats_generated):
         loss = 0
@@ -681,6 +691,19 @@ class VitsGeneratorLoss(nn.Module):
     def cosine_similarity_loss(gt_spk_emb, syn_spk_emb):
         return -torch.nn.functional.cosine_similarity(gt_spk_emb, syn_spk_emb).mean()
 
+    @staticmethod
+    def get_audio_transcript(audio_wav, transcriber):
+        transcript = transcriber(audio_wav)
+        transcript = transcript["text"].lower()
+        return transcript
+
+    @staticmethod
+    def content_text_loss(ref_text, pred_text, wer):
+        reference = [ref_text.lower()]
+        prediction = [pred_text]
+        wer_score = wer.compute(predictions=prediction, references=reference)
+        return wer_score
+
     def forward(
         self,
         mel_slice,
@@ -697,6 +720,10 @@ class VitsGeneratorLoss(nn.Module):
         use_speaker_encoder_as_loss=False,
         gt_spk_emb=None,
         syn_spk_emb=None,
+        seg_wav=None,
+        raw_text=None,
+        # y_wav=None,
+        # y_hat_wav=None,
     ):
         """
         Shapes:
@@ -710,8 +737,12 @@ class VitsGeneratorLoss(nn.Module):
             - scores_disc_fake[i]: :math:`[B, C]`
             - feats_disc_fake[i][j]: :math:`[B, C, T', P]`
             - feats_disc_real[i][j]: :math:`[B, C, T', P]`
+            - seg_wav: :math:`[B, 1, T_wav]`
+            # - y_wav: :math:`[B, 1, T_wav]`
+            # - y_hat_wav: :math:`[B, 1, T_wav]`
         """
         loss = 0.0
+        content_text_loss_alpha = 1.0
         return_dict = {}
         z_mask = sequence_mask(z_len).float()
         # compute losses
@@ -731,6 +762,20 @@ class VitsGeneratorLoss(nn.Module):
             loss_se = self.cosine_similarity_loss(gt_spk_emb, syn_spk_emb) * self.spk_encoder_loss_alpha
             loss = loss + loss_se
             return_dict["loss_spk_encoder"] = loss_se
+
+        # CTL loss
+        seg_transcript = self.get_audio_transcript(seg_wav, self.transcriber)
+        loss_ctl = self.content_text_loss(raw_text, seg_transcript, self.wer) * content_text_loss_alpha
+        loss = loss_ctl + loss_se
+        return_dict["loss_ctl"] = loss_ctl
+
+        # MultiScaleSTFTLoss
+        # stft_loss_weight: float = 0.5
+        # stft_loss_mg, stft_loss_sc = self.stft_loss(y_hat_wav[:, :, : y_wav.size(2)].squeeze(1), y_wav.squeeze(1))
+        # return_dict["G_stft_loss_mg"] = stft_loss_mg
+        # return_dict["G_stft_loss_sc"] = stft_loss_sc
+        # loss = loss + stft_loss_weight * (stft_loss_mg + stft_loss_sc)
+
         # pass losses to the dict
         return_dict["loss_gen"] = loss_gen
         return_dict["loss_kl"] = loss_kl
